@@ -4,11 +4,15 @@ warnings.filterwarnings('ignore', category=UserWarning, module='keras.src.traine
 import tensorflow as tf
 from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout, BatchNormalization
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, LearningRateScheduler
 import matplotlib.pyplot as plt
 import math
+
+# Define image size and batch size
+IMG_SIZE = 200
+BATCH_SIZE = 16
 
 # Advanced data augmentation using ImageDataGenerator
 train_datagen = ImageDataGenerator(
@@ -27,15 +31,15 @@ val_datagen = ImageDataGenerator(rescale=1./255)
 # Create data generators
 train_generator = train_datagen.flow_from_directory(
     '../data/train/images',
-    target_size=(224, 224),
-    batch_size=32,
+    target_size=(IMG_SIZE, IMG_SIZE),
+    batch_size=BATCH_SIZE,
     class_mode='categorical'
 )
 
 validation_generator = val_datagen.flow_from_directory(
     '../data/validation/images',
-    target_size=(224, 224),
-    batch_size=32,
+    target_size=(IMG_SIZE, IMG_SIZE),
+    batch_size=BATCH_SIZE,
     class_mode='categorical'
 )
 
@@ -55,14 +59,24 @@ validation_steps = max(validation_steps, 1)
 print(f"Steps per epoch: {steps_per_epoch}")
 print(f"Validation steps: {validation_steps}")
 
+# Learning rate scheduler function
+def scheduler(epoch, lr):
+    if epoch < 10:
+        return lr
+    else:
+        return float(lr * tf.math.exp(-0.1))
+
 # Load the MobileNetV2 model, excluding the top layers
-base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(IMG_SIZE, IMG_SIZE, 3))
 
 # Add custom layers on top of MobileNetV2
 x = base_model.output
 x = GlobalAveragePooling2D()(x)
+x = BatchNormalization()(x)
 x = Dropout(0.5)(x)  # Add dropout for regularization
-x = Dense(1024, activation='relu')(x)
+x = Dense(1024, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(0.01))(x)  # Add L2 regularization
+x = BatchNormalization()(x)
+x = Dropout(0.5)(x)  # Add another dropout layer
 predictions = Dense(train_generator.num_classes, activation='softmax')(x)
 
 # Define the model
@@ -76,21 +90,22 @@ for layer in base_model.layers:
 model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
 
 # Define callbacks
-early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
-reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3, min_lr=1e-6)
+early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=1e-6)
 model_checkpoint = ModelCheckpoint('../models/best_model.keras', save_best_only=True)
+lr_scheduler = LearningRateScheduler(scheduler)
 
 # Custom training loop with .repeat()
 train_dataset = tf.data.Dataset.from_generator(
     lambda: train_generator,
     output_types=(tf.float32, tf.float32),
-    output_shapes=([None, 224, 224, 3], [None, train_generator.num_classes])
+    output_shapes=([None, IMG_SIZE, IMG_SIZE, 3], [None, train_generator.num_classes])
 ).repeat()
 
 val_dataset = tf.data.Dataset.from_generator(
     lambda: validation_generator,
     output_types=(tf.float32, tf.float32),
-    output_shapes=([None, 224, 224, 3], [None, validation_generator.num_classes])
+    output_shapes=([None, IMG_SIZE, IMG_SIZE, 3], [None, validation_generator.num_classes])
 ).repeat()
 
 # Train the model
@@ -99,8 +114,8 @@ history = model.fit(
     steps_per_epoch=steps_per_epoch,
     validation_data=val_dataset,
     validation_steps=validation_steps,
-    epochs=20,
-    callbacks=[early_stopping, reduce_lr, model_checkpoint]
+    epochs=30,
+    callbacks=[early_stopping, reduce_lr, model_checkpoint, lr_scheduler]
 )
 
 # Unfreeze some layers and fine-tune the model
@@ -116,8 +131,8 @@ history_fine = model.fit(
     steps_per_epoch=steps_per_epoch,
     validation_data=val_dataset,
     validation_steps=validation_steps,
-    epochs=20,
-    callbacks=[early_stopping, reduce_lr, model_checkpoint]
+    epochs=30,
+    callbacks=[early_stopping, reduce_lr, model_checkpoint, lr_scheduler]
 )
 
 # Save the fine-tuned model
