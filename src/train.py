@@ -10,10 +10,6 @@ from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCh
 import matplotlib.pyplot as plt
 import math
 
-# Define image size and batch size
-IMG_SIZE = 200
-BATCH_SIZE = 16
-
 # Advanced data augmentation using ImageDataGenerator
 train_datagen = ImageDataGenerator(
     rescale=1./255,
@@ -23,24 +19,25 @@ train_datagen = ImageDataGenerator(
     shear_range=0.3,
     zoom_range=0.3,
     horizontal_flip=True,
-    fill_mode='nearest'
+    fill_mode='nearest',
+    validation_split=0.2  # Use validation split for internal validation
 )
-
-val_datagen = ImageDataGenerator(rescale=1./255)
 
 # Create data generators
 train_generator = train_datagen.flow_from_directory(
     '../data/train/images',
-    target_size=(IMG_SIZE, IMG_SIZE),
-    batch_size=BATCH_SIZE,
-    class_mode='categorical'
+    target_size=(224, 224),
+    batch_size=16,
+    class_mode='categorical',
+    subset='training'
 )
 
-validation_generator = val_datagen.flow_from_directory(
-    '../data/validation/images',
-    target_size=(IMG_SIZE, IMG_SIZE),
-    batch_size=BATCH_SIZE,
-    class_mode='categorical'
+validation_generator = train_datagen.flow_from_directory(
+    '../data/train/images',
+    target_size=(224, 224),
+    batch_size=16,
+    class_mode='categorical',
+    subset='validation'
 )
 
 # Debug print to check the number of samples
@@ -59,22 +56,15 @@ validation_steps = max(validation_steps, 1)
 print(f"Steps per epoch: {steps_per_epoch}")
 print(f"Validation steps: {validation_steps}")
 
-# Learning rate scheduler function
-def scheduler(epoch, lr):
-    if epoch < 10:
-        return lr
-    else:
-        return float(lr * tf.math.exp(-0.1))
-
 # Load the MobileNetV2 model, excluding the top layers
-base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(IMG_SIZE, IMG_SIZE, 3))
+base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
 
 # Add custom layers on top of MobileNetV2
 x = base_model.output
 x = GlobalAveragePooling2D()(x)
 x = BatchNormalization()(x)
 x = Dropout(0.5)(x)  # Add dropout for regularization
-x = Dense(1024, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(0.01))(x)  # Add L2 regularization
+x = Dense(256, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(0.01))(x)  # Add L2 regularization
 x = BatchNormalization()(x)
 x = Dropout(0.5)(x)  # Add another dropout layer
 predictions = Dense(train_generator.num_classes, activation='softmax')(x)
@@ -93,19 +83,23 @@ model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accur
 early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
 reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=1e-6)
 model_checkpoint = ModelCheckpoint('../models/best_model.keras', save_best_only=True)
-lr_scheduler = LearningRateScheduler(scheduler)
 
-# Custom training loop with .repeat()
+def scheduler(epoch, lr):
+    return 0.001 * math.exp(-0.1 * epoch)
+
+lr_scheduler = LearningRateScheduler(lambda epoch, lr: float(scheduler(epoch, lr)))
+
+# Repeat datasets to avoid running out of data
 train_dataset = tf.data.Dataset.from_generator(
     lambda: train_generator,
     output_types=(tf.float32, tf.float32),
-    output_shapes=([None, IMG_SIZE, IMG_SIZE, 3], [None, train_generator.num_classes])
+    output_shapes=([None, 224, 224, 3], [None, train_generator.num_classes])
 ).repeat()
 
 val_dataset = tf.data.Dataset.from_generator(
     lambda: validation_generator,
     output_types=(tf.float32, tf.float32),
-    output_shapes=([None, IMG_SIZE, IMG_SIZE, 3], [None, validation_generator.num_classes])
+    output_shapes=([None, 224, 224, 3], [None, validation_generator.num_classes])
 ).repeat()
 
 # Train the model
@@ -119,8 +113,10 @@ history = model.fit(
 )
 
 # Unfreeze some layers and fine-tune the model
-for layer in base_model.layers[-20:]:
-    layer.trainable = True
+base_model.trainable = True
+fine_tune_at = 50
+for layer in base_model.layers[:fine_tune_at]:
+    layer.trainable = False
 
 # Recompile the model with a lower learning rate
 model.compile(optimizer=tf.keras.optimizers.Adam(1e-5), loss='categorical_crossentropy', metrics=['accuracy'])
