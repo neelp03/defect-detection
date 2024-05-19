@@ -9,6 +9,11 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, LearningRateScheduler
 import matplotlib.pyplot as plt
 import math
+import mlflow
+import mlflow.tensorflow
+
+# Enable auto-logging to MLflow to capture the metrics, parameters, and models
+mlflow.tensorflow.autolog()
 
 # Advanced data augmentation using ImageDataGenerator
 train_datagen = ImageDataGenerator(
@@ -19,25 +24,24 @@ train_datagen = ImageDataGenerator(
     shear_range=0.3,
     zoom_range=0.3,
     horizontal_flip=True,
-    fill_mode='nearest',
-    validation_split=0.2  # Use validation split for internal validation
+    fill_mode='nearest'
 )
+
+val_datagen = ImageDataGenerator(rescale=1./255)
 
 # Create data generators
 train_generator = train_datagen.flow_from_directory(
     '../data/train/images',
-    target_size=(224, 224),
+    target_size=(200, 200),
     batch_size=16,
-    class_mode='categorical',
-    subset='training'
+    class_mode='categorical'
 )
 
-validation_generator = train_datagen.flow_from_directory(
-    '../data/train/images',
-    target_size=(224, 224),
+validation_generator = val_datagen.flow_from_directory(
+    '../data/validation/images',
+    target_size=(200, 200),
     batch_size=16,
-    class_mode='categorical',
-    subset='validation'
+    class_mode='categorical'
 )
 
 # Debug print to check the number of samples
@@ -56,15 +60,22 @@ validation_steps = max(validation_steps, 1)
 print(f"Steps per epoch: {steps_per_epoch}")
 print(f"Validation steps: {validation_steps}")
 
+# Learning rate scheduler function
+def scheduler(epoch, lr):
+    if epoch < 10:
+        return lr
+    else:
+        return float(lr * tf.math.exp(-0.1))
+
 # Load the MobileNetV2 model, excluding the top layers
-base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(200, 200, 3))
 
 # Add custom layers on top of MobileNetV2
 x = base_model.output
 x = GlobalAveragePooling2D()(x)
 x = BatchNormalization()(x)
 x = Dropout(0.5)(x)  # Add dropout for regularization
-x = Dense(256, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(0.01))(x)  # Add L2 regularization
+x = Dense(1024, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(0.01))(x)  # Add L2 regularization
 x = BatchNormalization()(x)
 x = Dropout(0.5)(x)  # Add another dropout layer
 predictions = Dense(train_generator.num_classes, activation='softmax')(x)
@@ -83,61 +94,56 @@ model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accur
 early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
 reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=1e-6)
 model_checkpoint = ModelCheckpoint('../models/best_model.keras', save_best_only=True)
+lr_scheduler = LearningRateScheduler(scheduler)
 
-def scheduler(epoch, lr):
-    return 0.001 * math.exp(-0.1 * epoch)
-
-lr_scheduler = LearningRateScheduler(lambda epoch, lr: float(scheduler(epoch, lr)))
-
-# Repeat datasets to avoid running out of data
+# Custom training loop with .repeat()
 train_dataset = tf.data.Dataset.from_generator(
     lambda: train_generator,
     output_types=(tf.float32, tf.float32),
-    output_shapes=([None, 224, 224, 3], [None, train_generator.num_classes])
+    output_shapes=([None, 200, 200, 3], [None, train_generator.num_classes])
 ).repeat()
 
 val_dataset = tf.data.Dataset.from_generator(
     lambda: validation_generator,
     output_types=(tf.float32, tf.float32),
-    output_shapes=([None, 224, 224, 3], [None, validation_generator.num_classes])
+    output_shapes=([None, 200, 200, 3], [None, validation_generator.num_classes])
 ).repeat()
 
 # Train the model
-history = model.fit(
-    train_dataset,
-    steps_per_epoch=steps_per_epoch,
-    validation_data=val_dataset,
-    validation_steps=validation_steps,
-    epochs=30,
-    callbacks=[early_stopping, reduce_lr, model_checkpoint, lr_scheduler]
-)
+with mlflow.start_run() as run:
+    history = model.fit(
+        train_dataset,
+        steps_per_epoch=steps_per_epoch,
+        validation_data=val_dataset,
+        validation_steps=validation_steps,
+        epochs=30,
+        callbacks=[early_stopping, reduce_lr, model_checkpoint, lr_scheduler]
+    )
 
-# Unfreeze some layers and fine-tune the model
-base_model.trainable = True
-fine_tune_at = 50
-for layer in base_model.layers[:fine_tune_at]:
-    layer.trainable = False
+    # Unfreeze more layers for fine-tuning
+    for layer in base_model.layers[:100]:
+        layer.trainable = True
 
-# Recompile the model with a lower learning rate
-model.compile(optimizer=tf.keras.optimizers.Adam(1e-5), loss='categorical_crossentropy', metrics=['accuracy'])
+    # Recompile the model with a lower learning rate
+    model.compile(optimizer=tf.keras.optimizers.Adam(1e-5), loss='categorical_crossentropy', metrics=['accuracy'])
 
-# Continue training with fine-tuning
-history_fine = model.fit(
-    train_dataset,
-    steps_per_epoch=steps_per_epoch,
-    validation_data=val_dataset,
-    validation_steps=validation_steps,
-    epochs=30,
-    callbacks=[early_stopping, reduce_lr, model_checkpoint, lr_scheduler]
-)
+    # Continue training with fine-tuning
+    history_fine = model.fit(
+        train_dataset,
+        steps_per_epoch=steps_per_epoch,
+        validation_data=val_dataset,
+        validation_steps=validation_steps,
+        epochs=30,
+        callbacks=[early_stopping, reduce_lr, model_checkpoint, lr_scheduler]
+    )
 
-# Save the fine-tuned model
-model.save('../models/mobilenetv2_finetuned_model.keras')
+    # Save the fine-tuned model
+    model.save('../models/mobilenetv2_finetuned_model.keras')
 
-# Evaluate the fine-tuned model
-loss, accuracy = model.evaluate(val_dataset, steps=validation_steps)
-print(f"Fine-Tuned Validation Loss: {loss}")
-print(f"Fine-Tuned Validation Accuracy: {accuracy}")
+    # Evaluate the fine-tuned model
+    loss, accuracy = model.evaluate(val_dataset, steps=validation_steps)
+    print(f"Fine-Tuned Validation Loss: {loss}")
+    print(f"Fine-Tuned Validation Accuracy: {accuracy}")
 
 # Plot training & validation accuracy values
 plt.figure(figsize=(12, 4))
@@ -158,6 +164,7 @@ plt.ylabel('Loss')
 plt.xlabel('Epoch')
 plt.legend(['Train', 'Validation'], loc='upper left')
 
+plt.savefig('../models/training_curves.png')
 plt.show()
 
 # Plot fine-tuned training & validation accuracy values
@@ -179,6 +186,7 @@ plt.ylabel('Loss')
 plt.xlabel('Epoch')
 plt.legend(['Train', 'Validation'], loc='upper left')
 
+plt.savefig('../models/fine_tuning_curves.png')
 plt.show()
 
 def main():
