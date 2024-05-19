@@ -1,18 +1,23 @@
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='keras.src.trainers.data_adapters.py_dataset_adapter')
+
 import tensorflow as tf
 from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 import matplotlib.pyplot as plt
+import math
 
-# Define data generators
+# Advanced data augmentation using ImageDataGenerator
 train_datagen = ImageDataGenerator(
     rescale=1./255,
-    rotation_range=20,
-    width_shift_range=0.2,
-    height_shift_range=0.2,
-    shear_range=0.2,
-    zoom_range=0.2,
+    rotation_range=40,
+    width_shift_range=0.3,
+    height_shift_range=0.3,
+    shear_range=0.3,
+    zoom_range=0.3,
     horizontal_flip=True,
     fill_mode='nearest'
 )
@@ -21,22 +26,34 @@ val_datagen = ImageDataGenerator(rescale=1./255)
 
 # Create data generators
 train_generator = train_datagen.flow_from_directory(
-    '../data/preprocessed/train',
-    target_size=(224, 224),  # Set target size to 224x224
+    '../data/train/images',
+    target_size=(224, 224),
     batch_size=32,
     class_mode='categorical'
 )
 
 validation_generator = val_datagen.flow_from_directory(
-    '../data/preprocessed/validation',
-    target_size=(224, 224),  # Set target size to 224x224
+    '../data/validation/images',
+    target_size=(224, 224),
     batch_size=32,
     class_mode='categorical'
 )
 
-# Calculate steps per epoch
-steps_per_epoch = train_generator.samples // train_generator.batch_size
-validation_steps = validation_generator.samples // validation_generator.batch_size
+# Debug print to check the number of samples
+print(f"Number of training samples: {train_generator.samples}")
+print(f"Number of validation samples: {validation_generator.samples}")
+
+# Calculate steps per epoch based on the number of samples
+steps_per_epoch = math.ceil(train_generator.samples / train_generator.batch_size)
+validation_steps = math.ceil(validation_generator.samples / validation_generator.batch_size)
+
+# Ensure steps per epoch are at least 1
+steps_per_epoch = max(steps_per_epoch, 1)
+validation_steps = max(validation_steps, 1)
+
+# Debug print to check steps per epoch
+print(f"Steps per epoch: {steps_per_epoch}")
+print(f"Validation steps: {validation_steps}")
 
 # Load the MobileNetV2 model, excluding the top layers
 base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
@@ -44,35 +61,72 @@ base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(224
 # Add custom layers on top of MobileNetV2
 x = base_model.output
 x = GlobalAveragePooling2D()(x)
-x = Dense(1024, activation='relu')(x)  # Add a fully connected layer
-predictions = Dense(train_generator.num_classes, activation='softmax')(x)  # Add the output layer
+x = Dropout(0.5)(x)  # Add dropout for regularization
+x = Dense(1024, activation='relu')(x)
+predictions = Dense(train_generator.num_classes, activation='softmax')(x)
 
 # Define the model
 model = Model(inputs=base_model.input, outputs=predictions)
 
-# Freeze the layers of MobileNetV2
+# Freeze the layers of MobileNetV2 initially
 for layer in base_model.layers:
     layer.trainable = False
 
 # Compile the model
 model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
 
+# Define callbacks
+early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3, min_lr=1e-6)
+model_checkpoint = ModelCheckpoint('../models/best_model.keras', save_best_only=True)
+
+# Custom training loop with .repeat()
+train_dataset = tf.data.Dataset.from_generator(
+    lambda: train_generator,
+    output_types=(tf.float32, tf.float32),
+    output_shapes=([None, 224, 224, 3], [None, train_generator.num_classes])
+).repeat()
+
+val_dataset = tf.data.Dataset.from_generator(
+    lambda: validation_generator,
+    output_types=(tf.float32, tf.float32),
+    output_shapes=([None, 224, 224, 3], [None, validation_generator.num_classes])
+).repeat()
+
 # Train the model
 history = model.fit(
-    train_generator,
+    train_dataset,
     steps_per_epoch=steps_per_epoch,
-    validation_data=validation_generator,
+    validation_data=val_dataset,
     validation_steps=validation_steps,
-    epochs=10
+    epochs=20,
+    callbacks=[early_stopping, reduce_lr, model_checkpoint]
 )
 
-# Save the trained model in the new Keras format
-model.save('../models/mobilenetv2_model.keras')
+# Unfreeze some layers and fine-tune the model
+for layer in base_model.layers[-20:]:
+    layer.trainable = True
 
-# Evaluate the model
-loss, accuracy = model.evaluate(validation_generator)
-print(f"Validation Loss: {loss}")
-print(f"Validation Accuracy: {accuracy}")
+# Recompile the model with a lower learning rate
+model.compile(optimizer=tf.keras.optimizers.Adam(1e-5), loss='categorical_crossentropy', metrics=['accuracy'])
+
+# Continue training with fine-tuning
+history_fine = model.fit(
+    train_dataset,
+    steps_per_epoch=steps_per_epoch,
+    validation_data=val_dataset,
+    validation_steps=validation_steps,
+    epochs=20,
+    callbacks=[early_stopping, reduce_lr, model_checkpoint]
+)
+
+# Save the fine-tuned model
+model.save('../models/mobilenetv2_finetuned_model.keras')
+
+# Evaluate the fine-tuned model
+loss, accuracy = model.evaluate(val_dataset, steps=validation_steps)
+print(f"Fine-Tuned Validation Loss: {loss}")
+print(f"Fine-Tuned Validation Accuracy: {accuracy}")
 
 # Plot training & validation accuracy values
 plt.figure(figsize=(12, 4))
@@ -94,30 +148,6 @@ plt.xlabel('Epoch')
 plt.legend(['Train', 'Validation'], loc='upper left')
 
 plt.show()
-
-# Fine-tune the model
-for layer in base_model.layers[-20:]:
-    layer.trainable = True
-
-# Recompile the model with a lower learning rate
-model.compile(optimizer=tf.keras.optimizers.Adam(1e-5), loss='categorical_crossentropy', metrics=['accuracy'])
-
-# Continue training
-history_fine = model.fit(
-    train_generator,
-    steps_per_epoch=steps_per_epoch,
-    validation_data=validation_generator,
-    validation_steps=validation_steps,
-    epochs=10
-)
-
-# Save the fine-tuned model in the new Keras format
-model.save('../models/mobilenetv2_finetuned_model.keras')
-
-# Evaluate the fine-tuned model
-loss, accuracy = model.evaluate(validation_generator)
-print(f"Fine-Tuned Validation Loss: {loss}")
-print(f"Fine-Tuned Validation Accuracy: {accuracy}")
 
 # Plot fine-tuned training & validation accuracy values
 plt.figure(figsize=(12, 4))
